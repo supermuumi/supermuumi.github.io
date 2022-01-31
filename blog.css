@@ -1,0 +1,18 @@
+body {
+    background-color: #caccaa;
+    font-family: 'Catamaran', sans-serif;
+    font-size: 16pt;
+}
+
+.content {
+    width: 50%;
+    background-color: #eaeaea;
+    position: relative;
+    left: 25%;
+    padding: 3em;
+}
+
+h1 {
+    color: black; 
+    font-family: 'Bebas Neue', cursive;
+}
