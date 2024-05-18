@@ -16,3 +16,14 @@ h1 {
     color: black; 
     font-family: 'Bebas Neue', cursive;
 }
+
+.codestyle {
+    font-optical-sizing: auto;
+    font-weight: 400;
+    font-style: normal;
+    font-size: 10pt;
+    background-color: #dddddd;
+    overflow-x:auto;
+    padding: 1em;
+    font-family: "Source Code Pro", monospace;
+}
