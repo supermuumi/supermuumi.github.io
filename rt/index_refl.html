@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Minimal WebGPU Compute Raytracer with Dynamic Spheres</title>
+  <style>
+    body, html { margin: 0; padding: 0; overflow: hidden; height: 100%; }
+    canvas { width: 100%; height: 100%; display: block; }
+  </style>
+</head>
+<body>
+<canvas id="webgpu-canvas"></canvas>
+<script type="module">
+async function init() {
+  const canvas = document.getElementById('webgpu-canvas');
+  const adapter = await navigator.gpu.requestAdapter();
+  const device = await adapter.requestDevice();
+  const context = canvas.getContext('webgpu');
+
+  const format = navigator.gpu.getPreferredCanvasFormat();
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = Math.floor(canvas.clientWidth * dpr);
+    canvas.height = Math.floor(canvas.clientHeight * dpr);
+    context.configure({ device, format, alphaMode: 'opaque' });
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  const computeShaderCode = `
+struct CameraData {
+  cameraPosition : vec3<f32>, _pad1 : f32,
+  targetPosition : vec3<f32>, _pad2 : f32,
+  aspectRatio : f32, _pad3 : vec3<f32>
+};
+
+struct Object {
+  position : vec3<f32>,
+  radius : f32,
+  color : vec3<f32>,
+  objectType : u32,
+  reflectivity : f32,
+  _pad4 : vec2<f32>
+};
+
+@group(0) @binding(0) var storageImage : texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(1) var<uniform> cameraData : CameraData;
+@group(0) @binding(2) var<storage, read> objects : array<Object>;
+
+@compute @workgroup_size(8,8)
+fn main(@builtin(global_invocation_id) global_id : vec3<u32>) {
+  let imgSize = vec2<u32>(textureDimensions(storageImage));
+  if (global_id.x >= imgSize.x || global_id.y >= imgSize.y) { return; }
+
+  let uv = (vec2<f32>(f32(global_id.x), f32(imgSize.y - 1u - global_id.y)) + vec2<f32>(0.5)) / vec2<f32>(f32(imgSize.x), f32(imgSize.y));
+  let uv2 = uv * 2.0 - vec2<f32>(1.0);
+
+  let forward = normalize(cameraData.targetPosition - cameraData.cameraPosition);
+  let right = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), forward));
+  let up = cross(forward, right);
+
+  let sensorX = uv2.x * cameraData.aspectRatio;
+  let sensorY = uv2.y;
+  let rayDir = normalize(forward + sensorX * right + sensorY * up);
+  let ro = cameraData.cameraPosition;
+  let rd = rayDir;
+
+  var hit = false;
+  var closestT = 1e20;
+  var hitNormal = vec3<f32>(0.0);
+  var hitColor = vec3<f32>(0.7, 0.8, 1.0); // default sky color
+  var hitReflectivity = 0.0;
+
+  for (var i = 0u; i < arrayLength(&objects); i = i + 1u) {
+    let obj = objects[i];
+    if (obj.objectType == 0u) { // Sphere
+      let sphere = obj;
+      let oc = ro - sphere.position;
+      let a = dot(rd, rd);
+      let b = 2.0 * dot(oc, rd);
+      let c = dot(oc, oc) - sphere.radius * sphere.radius;
+      let discriminant = b*b - 4.0*a*c;
+
+      if (discriminant > 0.0) {
+        let t = (-b - sqrt(discriminant)) / (2.0 * a);
+        if (t > 0.0 && t < closestT) {
+          closestT = t;
+          hit = true;
+          hitNormal = normalize((ro + rd * t) - sphere.position); // Normal at hit point
+          hitColor = sphere.color;
+          hitReflectivity = obj.reflectivity;
+        }
+      }
+    }
+  }
+
+  var color = vec3<f32>(0.0);
+    if (hit) {
+      let lightDir = normalize(vec3<f32>(-0.5, 1.0, -0.5));
+      let diffuse = max(dot(hitNormal, lightDir), 0.0);
+      let ambient = 0.2;
+      let lighting = ambient + (1.0 - ambient) * diffuse;
+
+      var reflectionColor = vec3<f32>(0.7, 0.8, 1.0);
+
+      if (hitReflectivity > 0.01) {
+        let reflectDir = normalize(reflect(rd, hitNormal));
+        let reflectOrigin = ro + rd * closestT + hitNormal * 0.001;
+        var reflectionHit = false;
+        var reflectionClosestT = 1e20;
+
+        for (var k = 0u; k < arrayLength(&objects); k = k + 1u) {
+          let obj = objects[k];
+          if (obj.objectType == 0u) {
+            let oc = reflectOrigin - obj.position;
+            let a = dot(reflectDir, reflectDir);
+            let b = 2.0 * dot(oc, reflectDir);
+            let c = dot(oc, oc) - obj.radius * obj.radius;
+            let discriminant = b*b - 4.0*a*c;
+
+            if (discriminant > 0.0) {
+              let t = (-b - sqrt(discriminant)) / (2.0 * a);
+              if (t > 0.0 && t < reflectionClosestT) {
+                reflectionClosestT = t;
+                reflectionColor = obj.color;
+                reflectionHit = true;
+              }
+            }
+          }
+        }
+      }
+
+      color = mix(hitColor * lighting, reflectionColor, hitReflectivity);
+    }
+  textureStore(storageImage, vec2<i32>(global_id.xy), vec4<f32>(color, 1.0));
+
+  // if (hit) {
+
+  //   var inShadow = false;
+  //   let shadowOrigin = ro + rd * closestT + hitNormal * 0.001; // small bias to avoid self-intersection
+  //   let shadowDir = normalize(vec3<f32>(-0.5, 1.0, -0.5)); // same as lightDir
+
+  //   for (var j = 0u; j < arrayLength(&objects); j = j + 1u) {
+  //     let sphere = objects[j];
+  //     let oc = shadowOrigin - sphere.position;
+  //     let a = dot(shadowDir, shadowDir);
+  //     let b = 2.0 * dot(oc, shadowDir);
+  //     let c = dot(oc, oc) - sphere.radius * sphere.radius;
+  //     let discriminant = b*b - 4.0*a*c;
+
+  //     if (discriminant > 0.0) {
+  //       let t = (-b - sqrt(discriminant)) / (2.0 * a);
+  //       if (t > 0.001) { // must be positive and small
+  //         inShadow = true;
+  //         break;
+  //       }
+  //     }
+  //   }
+
+  //   let hitPos = ro + rd * closestT;
+  //   let lightDir = normalize(vec3<f32>(-0.5, 1.0, -0.5));
+  //   let viewDir = normalize(cameraData.cameraPosition - hitPos);
+  //   let reflectDir = reflect(-lightDir, hitNormal);
+
+  //   let diffuse = max(dot(hitNormal, lightDir), 0.0);
+  //   let ambient = 0.2;
+  //   var lighting = ambient;
+  //   if (!inShadow) {
+  //     lighting = ambient + (1.0 - ambient) * diffuse;
+  //   }
+
+  //   let specularStrength = 0.5;
+  //   let shininess = 32.0;
+  //   let specAngle = max(dot(viewDir, reflectDir), 0.0);
+  //   let specular = specularStrength * pow(specAngle, shininess);
+
+  //   hitColor = hitColor * lighting + vec3<f32>(specular);
+  // }
+    
+  //textureStore(storageImage, vec2<i32>(global_id.xy), vec4<f32>(hitColor, 1.0));
+}
+  `;
+
+  const fullscreenQuadShader = `
+@group(0) @binding(0) var myTexture : texture_2d<f32>;
+@group(0) @binding(1) var mySampler : sampler;
+
+struct VertexOutput {
+  @builtin(position) position : vec4<f32>,
+  @location(0) uv : vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) index : u32) -> VertexOutput {
+  var pos = array<vec2<f32>, 3>(
+    vec2<f32>(-1.0, -3.0),
+    vec2<f32>(3.0, 1.0),
+    vec2<f32>(-1.0, 1.0)
+  );
+  var uv = array<vec2<f32>, 3>(
+    vec2<f32>(0.0, 2.0),
+    vec2<f32>(2.0, 0.0),
+    vec2<f32>(0.0, 0.0)
+  );
+  var output : VertexOutput;
+  output.position = vec4<f32>(pos[index], 0.0, 1.0);
+  output.uv = uv[index];
+  return output;
+}
+
+@fragment
+fn fs_main(@location(0) uv : vec2<f32>) -> @location(0) vec4<f32> {
+  return textureSample(myTexture, mySampler, uv);
+}
+  `;
+
+  const computeModule = device.createShaderModule({ code: computeShaderCode });
+  const quadModule = device.createShaderModule({ code: fullscreenQuadShader });
+
+  const uniformBuffer = device.createBuffer({ size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+
+  const TYPE_SPHERE = 0;
+  const TYPE_PLANE = 1;
+
+  // type 0 = sphere
+  // type 1 = plane
+  // type 2 = box
+  // type 3 = triangle
+  // type 4 = cylinder
+
+  const EL_SIZE = 8;
+  var objectData = new Float32Array(100 * EL_SIZE); // 100 objects, each with 7 floats (3 for position, 1 for radius, 3 for color, 1 for type, )
+  for (let i = 0, idx=0; i < 100; i++) {
+    objectData[idx] = Math.random() * 4 - 2; // x
+    objectData[idx + 1] = Math.random() * 4 - 2; // y 
+    objectData[idx + 2] = Math.random() * 4 - 2; // z
+    objectData[idx + 3] = Math.random() * 0.5 + 0.1; // radius
+    objectData[idx + 4] = Math.random(); // r
+    objectData[idx + 5] = Math.random(); // g
+    objectData[idx + 6] = Math.random(); // b
+    objectData[idx + 7] = TYPE_SPHERE; // type
+    //objectData[idx + 8] = 0.2 + Math.random()*0.8; // type
+    idx += EL_SIZE; // Move to the next object
+    //objectData.push(0, Math.random() * 2 + 1, Math.random() * 2 + 1, Math.random(), Math.random(), Math.random(), 0);
+  }
+
+  // const objectData = new Float32Array([
+  //   0, 1, 0, 1,   1, 0, 0, 0, // Sphere 1 (red)
+  //   2, 1, 0, 0.5, 0, 1, 0, 0  // Sphere 2 (green)
+  // ]);
+  const objectBuffer = device.createBuffer({
+    size: objectData.byteLength,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
+  });
+  device.queue.writeBuffer(objectBuffer, 0, objectData);
+
+  const computeTexture = device.createTexture({
+    size: [canvas.width, canvas.height],
+    format: 'rgba8unorm',
+    usage: GPUTextureUsage.STORAGE_BINDING | GPUTextureUsage.TEXTURE_BINDING
+  });
+
+  const sampler = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
+
+  const computeBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, storageTexture: { access: "write-only", format: 'rgba8unorm' } },
+      { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: {} },
+      { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } }
+    ]
+  });
+
+  const renderBindGroupLayout = device.createBindGroupLayout({
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: {} },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, sampler: {} }
+    ]
+  });
+
+  const computePipeline = device.createComputePipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [computeBindGroupLayout] }),
+    compute: { module: computeModule, entryPoint: 'main' }
+  });
+
+  const renderPipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [renderBindGroupLayout] }),
+    vertex: { module: quadModule, entryPoint: 'vs_main' },
+    fragment: { module: quadModule, entryPoint: 'fs_main', targets: [{ format }] },
+    primitive: { topology: 'triangle-list' }
+  });
+
+  const computeBindGroup = device.createBindGroup({
+    layout: computeBindGroupLayout,
+    entries: [
+      { binding: 0, resource: computeTexture.createView() },
+      { binding: 1, resource: { buffer: uniformBuffer } },
+      { binding: 2, resource: { buffer: objectBuffer } }
+    ]
+  });
+
+  const renderBindGroup = device.createBindGroup({
+    layout: renderBindGroupLayout,
+    entries: [
+      { binding: 0, resource: computeTexture.createView() },
+      { binding: 1, resource: sampler }
+    ]
+  });
+
+  let cameraAngle = { x: 0, y: 0 };
+  let cameraDistance = 5.0;
+  const target = [0, 1, 0];
+
+  canvas.addEventListener('mousemove', (e) => {
+    if (e.buttons) {
+      cameraAngle.x -= e.movementX * 0.005;
+      cameraAngle.y -= e.movementY * 0.005;
+      cameraAngle.y = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, cameraAngle.y));
+    }
+  });
+
+  canvas.addEventListener('wheel', (e) => {
+    cameraDistance += e.deltaY * 0.01;
+    cameraDistance = Math.max(1.0, Math.min(20.0, cameraDistance));
+  });
+
+  function frame() {
+    resize();
+
+    // const elSize = 9;
+    // for (let i = 0; i < 101; i++) {
+    //   objectData[i * elSize + 1] -= 0.01; // Move all objects down
+    //   if (objectData[i * elSize + 1] < -4) { // If an object goes below the plane
+    //     objectData[i * elSize + 1] = 4.0; //Math.random() * 4 + 0.5; // Reset its height to a random value above the plane
+    //   }
+    // }
+    // device.queue.writeBuffer(objectBuffer, 0, objectData);
+
+    const aspect = canvas.width / canvas.height;
+    const cosPitch = Math.cos(cameraAngle.y);
+    const sinPitch = Math.sin(cameraAngle.y);
+    const cosYaw = Math.cos(cameraAngle.x);
+    const sinYaw = Math.sin(cameraAngle.x);
+
+    const camX = cameraDistance * cosPitch * sinYaw;
+    const camY = cameraDistance * sinPitch;
+    const camZ = cameraDistance * cosPitch * cosYaw;
+
+    const cameraPosition = [camX + target[0], camY + target[1], camZ + target[2]];
+
+    device.queue.writeBuffer(uniformBuffer, 0, new Float32Array([
+      ...cameraPosition, 0.0,
+      ...target, 0.0,
+      aspect, 0.0, 0.0, 0.0
+    ]));
+
+    const encoder = device.createCommandEncoder();
+
+    const computePass = encoder.beginComputePass();
+    computePass.setPipeline(computePipeline);
+    computePass.setBindGroup(0, computeBindGroup);
+    computePass.dispatchWorkgroups(
+      Math.ceil(canvas.width / 8),
+      Math.ceil(canvas.height / 8)
+    );
+    computePass.end();
+
+    const renderPass = encoder.beginRenderPass({
+      colorAttachments: [{
+        view: context.getCurrentTexture().createView(),
+        loadOp: 'clear',
+        clearValue: { r: 0, g: 0, b: 0, a: 1 },
+        storeOp: 'store'
+      }]
+    });
+    renderPass.setPipeline(renderPipeline);
+    renderPass.setBindGroup(0, renderBindGroup);
+    renderPass.draw(3);
+    renderPass.end();
+
+    device.queue.submit([encoder.finish()]);
+    requestAnimationFrame(frame);
+  }
+
+  frame();
+}
+
+init();
+</script>
+</body>
+</html>
